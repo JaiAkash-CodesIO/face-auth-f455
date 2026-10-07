@@ -12,6 +12,8 @@ logging.basicConfig(level=logging.INFO)
 
 RSID_CLI_PATH = r"C:\Users\govar\AppData\Local\Programs\RealSenseID Tools\rsid-cli.exe"
 
+import queue
+
 class RealSenseService:
     def __init__(self, port="COM4", device_type="F45x"):
         self.port = port
@@ -25,8 +27,116 @@ class RealSenseService:
         self.cli_release_event = threading.Event()
         self.last_frame = None
 
+        # Persistent CLI Session for high-performance Host & Device Biometrics
+        self._session_proc = None
+        self._session_queue = None
+        self._session_thread = None
+
     def set_auth_callback(self, callback):
         self._on_auth_callback = callback
+
+    def _ensure_session(self):
+        """Ensures the background rsid-cli process is running and ready to accept commands."""
+        if not os.path.exists(self.cli_path):
+            return False
+
+        if self._session_proc is not None and self._session_proc.poll() is None:
+            return True
+
+        # Clean up any dead process
+        self._close_session()
+
+        try:
+            cmd = [self.cli_path, "--port", self.port, "--device-type", self.device_type]
+            self._session_proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            self._session_queue = queue.Queue()
+
+            def _reader():
+                try:
+                    for line in iter(self._session_proc.stdout.readline, ''):
+                        if self._session_queue:
+                            self._session_queue.put(line)
+                except Exception:
+                    pass
+
+            self._session_thread = threading.Thread(target=_reader, daemon=True)
+            self._session_thread.start()
+
+            # Wait briefly to consume startup banner
+            start_wait = time.time()
+            while time.time() - start_wait < 1.5:
+                try:
+                    line = self._session_queue.get(timeout=0.1)
+                    if "[?]" in line or "Choose an option" in line:
+                        break
+                except queue.Empty:
+                    continue
+            return True
+        except Exception as e:
+            logger.error(f"Error starting rsid-cli session: {e}")
+            self._close_session()
+            return False
+
+    def _close_session(self):
+        """Safely shuts down the background CLI process."""
+        if self._session_proc:
+            try:
+                self._session_proc.stdin.write("q\n")
+                self._session_proc.stdin.flush()
+                self._session_proc.wait(timeout=1.5)
+            except Exception:
+                try:
+                    self._session_proc.kill()
+                except Exception:
+                    pass
+        self._session_proc = None
+        self._session_queue = None
+        self._session_thread = None
+
+    def _exec_command(self, cmd_input: str, end_markers: list, timeout: float = 8.0) -> str:
+        """Sends command to CLI session and gathers response until an end marker is seen."""
+        if not self._ensure_session():
+            return ""
+
+        # Flush any leftover output from queue
+        while not self._session_queue.empty():
+            try:
+                self._session_queue.get_nowait()
+            except Exception:
+                break
+
+        try:
+            self._session_proc.stdin.write(cmd_input + "\n")
+            self._session_proc.stdin.flush()
+        except Exception as e:
+            logger.warning(f"Session pipe write error ({e}). Restarting session...")
+            self._close_session()
+            if not self._ensure_session():
+                return ""
+            self._session_proc.stdin.write(cmd_input + "\n")
+            self._session_proc.stdin.flush()
+
+        lines = []
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                line = self._session_queue.get(timeout=0.1)
+                lines.append(line)
+                if any(m.lower() in line.lower() for m in end_markers):
+                    break
+            except queue.Empty:
+                continue
+
+        output = "".join(lines)
+        logger.info(f"[CLI Session Output for '{cmd_input}']:\n{output}")
+        return output
 
     def check_device_connected(self):
         """Check if RSID CLI can reach the device on COM port."""
@@ -35,23 +145,74 @@ class RealSenseService:
 
         with self.hardware_lock:
             try:
-                cmd = [self.cli_path, "--port", self.port, "--device-type", self.device_type]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                out, _ = proc.communicate(input="q\n", timeout=5)
-                if "Using port: COM4" in out or proc.returncode == 0:
+                output = self._exec_command("U", ["[?]", "users\n"], timeout=4)
+                if "Using port: COM4" in output or "users" in output.lower():
                     return True, f"Connected to RealSense ID F455 on {self.port}"
                 return False, "Failed to connect to F455"
             except Exception as e:
                 return False, str(e)
 
-    def authenticate_single(self):
-        """Runs a single authentication scan on F455 hardware."""
+    def authenticate_host(self) -> dict:
+        """Executes Host Mode authentication ('A') matching against host faceprints."""
+        output = self._exec_command("A", ["[?]", "Match success", "Forbidden", "failed with status"], timeout=8)
+        
+        if "match success" in output.lower():
+            match = re.search(r"match success\.\s*user(?:_id)?:\s*([^\*\r\n]+)", output, re.IGNORECASE)
+            user_id = match.group(1).strip() if match else "Verified Host Worker"
+            return {
+                "success": True,
+                "status": "AUTHENTICATED",
+                "mode": "HOST",
+                "user_id": user_id,
+                "message": f"Host biometric faceprint match verified for '{user_id}'"
+            }
+        elif "forbidden" in output.lower():
+            return {
+                "success": False,
+                "status": "DENIED",
+                "mode": "HOST",
+                "user_id": None,
+                "message": "Host Mode: Face not recognized in host faceprint database"
+            }
+        else:
+            return {
+                "success": False,
+                "status": "DENIED",
+                "mode": "HOST",
+                "user_id": None,
+                "message": "Host Mode: Face extraction failed or no face detected"
+            }
+
+    def authenticate_device(self) -> dict:
+        """Executes On-Device hardware authentication ('a') matching against F455 hardware flash."""
+        output = self._exec_command("a", ["[?]", "authenticate success", "got result:", "status:"], timeout=8)
+
+        if "authenticate success" in output.lower() or "got result: success" in output.lower():
+            match = re.search(r"user(?:_id)?:\s*([^\*\r\n]+)", output, re.IGNORECASE)
+            user_id = match.group(1).strip() if match else "Jai Akash"
+            return {
+                "success": True,
+                "status": "AUTHENTICATED",
+                "mode": "DEVICE",
+                "user_id": user_id,
+                "message": f"Hardware on-device facial authentication verified for '{user_id}'"
+            }
+        else:
+            return {
+                "success": False,
+                "status": "DENIED",
+                "mode": "DEVICE",
+                "user_id": None,
+                "message": "On-Device: Face not recognized or spoof detected by Intel F455 hardware"
+            }
+
+    def authenticate_single(self, mode: str = "HYBRID"):
+        """
+        Runs facial authentication. Supports:
+        - 'HOST': Uses Host Mode faceprints ('A')
+        - 'DEVICE': Uses On-Device hardware memory ('a')
+        - 'HYBRID' / 'AUTO': Tries Host Mode first; falls back to On-Device memory if needed.
+        """
         if not os.path.exists(self.cli_path):
             return {
                 "success": False,
@@ -60,162 +221,142 @@ class RealSenseService:
             }
 
         with self.hardware_lock:
-            authenticated_user = None
-            auth_success = False
-            error_msg = None
+            auth_res = None
+            mode_upper = (mode or "HYBRID").upper()
 
-            try:
-                cmd = [self.cli_path, "--port", self.port, "--device-type", self.device_type]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                # Send 'a' then 'q' to authenticate and exit safely
-                out, _ = proc.communicate(input="a\nq\n", timeout=8)
-                logger.info(f"[F455 Auth Output]:\n{out}")
-
-                if "authenticate success" in out.lower() or "got result: success" in out.lower():
-                    auth_success = True
-                    match = re.search(r"user(?:_id)?:\s*([^\*\r\n]+)", out, re.IGNORECASE)
-                    if match:
-                        authenticated_user = match.group(1).strip()
+            if mode_upper == "HOST":
+                auth_res = self.authenticate_host()
+            elif mode_upper == "DEVICE":
+                auth_res = self.authenticate_device()
+            else:  # HYBRID / AUTO mode
+                # Try Host Mode first
+                host_res = self.authenticate_host()
+                if host_res.get("success"):
+                    auth_res = host_res
+                else:
+                    # Fall back to On-Device hardware flash
+                    dev_res = self.authenticate_device()
+                    if dev_res.get("success"):
+                        auth_res = dev_res
                     else:
-                        authenticated_user = "Jai Akash"
-                elif "got result: failure" in out.lower() or "got result: forbidden" in out.lower() or "got result: spoof" in out.lower():
-                    auth_success = False
-                    authenticated_user = None
-                    error_msg = "Face not recognized or spoof detected by Intel F455"
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                error_msg = "Authentication timed out"
-            except Exception as e:
-                logger.error(f"Error during single auth execution: {e}")
-                error_msg = str(e)
+                        auth_res = {
+                            "success": False,
+                            "status": "DENIED",
+                            "mode": "HYBRID",
+                            "user_id": None,
+                            "message": "Face not recognized in Host Faceprints or On-Device Hardware Flash"
+                        }
 
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             snapshot_b64 = self.capture_snapshot_b64()
 
-            if auth_success:
-                result = {
-                    "success": True,
-                    "status": "AUTHENTICATED",
-                    "user_id": authenticated_user or "Jai Akash",
-                    "timestamp": timestamp,
-                    "device": "Intel RealSense ID F455",
-                    "image_b64": snapshot_b64,
-                    "message": f"Face authenticated successfully for '{authenticated_user or 'Jai Akash'}'"
-                }
-            else:
-                result = {
-                    "success": False,
-                    "status": "DENIED",
-                    "user_id": None,
-                    "timestamp": timestamp,
-                    "device": "Intel RealSense ID F455",
-                    "image_b64": snapshot_b64,
-                    "message": error_msg or "Authentication failed or face not recognized / spoof detected"
-                }
+            result = {
+                "success": auth_res.get("success", False),
+                "status": auth_res.get("status", "DENIED"),
+                "auth_mode": auth_res.get("mode", "HYBRID"),
+                "user_id": auth_res.get("user_id"),
+                "timestamp": timestamp,
+                "device": "Intel RealSense ID F455",
+                "image_b64": snapshot_b64,
+                "message": auth_res.get("message", "Authentication scan completed")
+            }
 
             if self._on_auth_callback:
                 self._on_auth_callback(result)
 
             return result
 
-    def enroll_user(self, user_id: str):
-        """Enrolls a new user face profile in F455 hardware memory."""
+    def enroll_user_host(self, user_id: str) -> dict:
+        """Enrolls a user in Host Mode ('E') by extracting faceprint vector into host session."""
+        cmd = f"E\n{user_id}"
+        output = self._exec_command(cmd, ["[?]", "Status: Ok", "on_result:"], timeout=12)
+
+        if "got faceprints from device" in output.lower() or "on_result: status: success" in output.lower() or "status: ok" in output.lower():
+            return {
+                "success": True,
+                "status": "ENROLLED",
+                "mode": "HOST",
+                "user_id": user_id,
+                "message": f"Biometric faceprint extracted successfully for '{user_id}' and ready for Firebase Cloud storage."
+            }
+        elif "duplicate" in output.lower():
+            return {
+                "success": False,
+                "status": "DUPLICATE",
+                "mode": "HOST",
+                "user_id": user_id,
+                "message": f"Faceprint for '{user_id}' already enrolled in Host database."
+            }
+        else:
+            return {
+                "success": False,
+                "status": "FAILED",
+                "mode": "HOST",
+                "user_id": user_id,
+                "message": "Host faceprint extraction failed. Center face 40-70cm from F455 lens."
+            }
+
+    def enroll_user_device(self, user_id: str) -> dict:
+        """Enrolls a user in On-Device hardware flash memory ('e')."""
+        cmd = f"e\n{user_id}"
+        output = self._exec_command(cmd, ["[?]", "enroll success", "duplicatefaceprints", "got result:"], timeout=12)
+
+        if "enroll success" in output.lower() or "got result: success" in output.lower():
+            return {
+                "success": True,
+                "status": "ENROLLED",
+                "mode": "DEVICE",
+                "user_id": user_id,
+                "message": f"Face profile '{user_id}' successfully saved in F455 hardware flash memory."
+            }
+        elif "duplicate" in output.lower():
+            return {
+                "success": False,
+                "status": "DUPLICATE",
+                "mode": "DEVICE",
+                "user_id": user_id,
+                "message": "Faceprint is already enrolled in Intel F455 hardware flash memory."
+            }
+        else:
+            return {
+                "success": False,
+                "status": "FAILED",
+                "mode": "DEVICE",
+                "user_id": user_id,
+                "message": "Hardware enrollment failed on Intel F455 device."
+            }
+
+    def enroll_user(self, user_id: str, mode: str = "HOST"):
+        """
+        Enrolls a new user face profile.
+        - mode='HOST' (Default): Extracts biometric faceprint vector for Firebase storage.
+        - mode='DEVICE': Enrolls directly into F455 hardware flash memory.
+        """
         if not user_id:
             return {"success": False, "message": "User ID is required"}
 
         with self.hardware_lock:
-            enroll_success = False
-            is_duplicate = False
-            message_detail = ""
-
-            try:
-                cmd = [self.cli_path, "--port", self.port, "--device-type", self.device_type]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                # Send 'e', user_id, and then 'q'
-                out, _ = proc.communicate(input=f"e\n{user_id}\nq\n", timeout=10)
-                logger.info(f"[F455 Enroll Output]:\n{out}")
-
-                if "duplicatefaceprints" in out.lower() or "duplicate" in out.lower():
-                    is_duplicate = True
-                    enroll_success = False
-                    message_detail = f"Face is already enrolled in Intel F455 hardware memory."
-                elif "enroll success" in out.lower() or "got result: success" in out.lower() or "status: ok" in out.lower():
-                    enroll_success = True
-                    message_detail = f"Face profile '{user_id}' successfully saved in F455 hardware memory."
-                elif "got result: failure" in out.lower() or "got result: forbidden" in out.lower():
-                    enroll_success = False
-                    message_detail = "Enrollment failed on Intel F455 hardware."
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                message_detail = "Enrollment timed out"
-            except Exception as e:
-                message_detail = f"Enrollment exception: {e}"
+            mode_upper = (mode or "HOST").upper()
+            if mode_upper == "DEVICE":
+                enroll_res = self.enroll_user_device(user_id)
+            else:
+                enroll_res = self.enroll_user_host(user_id)
 
             snapshot_b64 = self.capture_snapshot_b64()
-
-            if enroll_success:
-                return {
-                    "success": True,
-                    "status": "ENROLLED",
-                    "user_id": user_id,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "image_b64": snapshot_b64,
-                    "message": message_detail or f"Successfully enrolled '{user_id}'"
-                }
-            elif is_duplicate:
-                return {
-                    "success": False,
-                    "status": "DUPLICATE",
-                    "user_id": user_id,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "image_b64": snapshot_b64,
-                    "message": "Faceprint is already enrolled in Intel F455 hardware memory."
-                }
-            else:
-                return {
-                    "success": False,
-                    "status": "FAILED",
-                    "user_id": user_id,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "image_b64": snapshot_b64,
-                    "message": message_detail or "Face enrollment failed or timed out. Center face 40-70cm from F455 lens."
-                }
+            enroll_res["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            enroll_res["image_b64"] = snapshot_b64
+            enroll_res["device"] = "Intel RealSense ID F455"
+            return enroll_res
 
     def list_users(self):
-        """Lists all enrolled user IDs from the F455 hardware."""
+        """Lists all enrolled user IDs from the F455 hardware flash memory."""
         if not os.path.exists(self.cli_path):
             return []
 
         with self.hardware_lock:
             users = []
             try:
-                cmd = [self.cli_path, "--port", self.port, "--device-type", self.device_type]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                out, _ = proc.communicate(input="u\nq\n", timeout=6)
+                out = self._exec_command("u", ["[?]"], timeout=5)
                 for line in out.splitlines():
                     match = re.match(r"^\d+\.\s*(.+)$", line.strip())
                     if match:
@@ -223,27 +364,48 @@ class RealSenseService:
                         if user_name:
                             users.append(user_name)
             except Exception as e:
-                logger.error(f"Error listing users: {e}")
-
+                logger.error(f"Error listing hardware users: {e}")
             return users
 
+    def list_host_users(self):
+        """Lists all enrolled user IDs from Host Mode database."""
+        if not os.path.exists(self.cli_path):
+            return []
+
+        with self.hardware_lock:
+            host_users = []
+            try:
+                out = self._exec_command("U", ["[?]"], timeout=5)
+                for line in out.splitlines():
+                    match = re.match(r"^\*\s*(.+)$", line.strip())
+                    if match:
+                        user_name = match.group(1).strip()
+                        if user_name:
+                            host_users.append(user_name)
+            except Exception as e:
+                logger.error(f"Error listing host users: {e}")
+            return host_users
+
     def get_capacity_info(self, force_refresh=False):
-        """Returns max capacity, enrolled count, and remaining slots left with caching."""
+        """Returns max capacity, hardware users, host users, and remaining slots left."""
         now = time.time()
         if not force_refresh and hasattr(self, '_capacity_cache') and self._capacity_cache:
             cache_time, data = self._capacity_cache
             if now - cache_time < 30.0:
                 return data
 
-        users = self.list_users()
+        dev_users = self.list_users()
+        host_users = self.list_host_users()
         max_cap = 1000
-        enrolled_count = len(users)
+        enrolled_count = len(dev_users)
         remaining = max_cap - enrolled_count
         data = {
             "max_capacity": max_cap,
             "enrolled_count": enrolled_count,
             "remaining_slots": remaining,
-            "users": users
+            "users": dev_users,
+            "host_users": host_users,
+            "host_enrolled_count": len(host_users)
         }
         self._capacity_cache = (now, data)
         return data

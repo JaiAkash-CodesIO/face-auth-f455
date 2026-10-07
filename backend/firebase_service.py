@@ -30,8 +30,9 @@ class FirebaseService:
 
         if cred_path and os.path.exists(cred_path):
             try:
-                cred = credentials.Certificate(cred_path)
-                firebase_admin.initialize_app(cred)
+                if not firebase_admin._apps:
+                    cred = credentials.Certificate(cred_path)
+                    firebase_admin.initialize_app(cred)
                 self.db = firestore.client()
                 self.initialized = True
                 logger.info("Firebase Firestore initialized successfully via Service Account certificate.")
@@ -41,13 +42,16 @@ class FirebaseService:
 
         logger.info("Firebase operating in Local Storage Mode (Ready for Firebase credentials).")
 
-    def save_worker_profile(self, worker_id: str, name: str, department: str = "General", role: str = "Worker", image_b64: str = None):
-        """Stores worker metadata and faceprint snapshot in Firebase Firestore / Local DB."""
+    def save_worker_profile(self, worker_id: str, name: str, department: str = "General", role: str = "Worker", image_b64: str = None, biometric_mode: str = "HOST", host_enrolled: bool = True, faceprint_status: str = "STORED_IN_FIREBASE"):
+        """Stores worker metadata and faceprint profile in Firebase Firestore / Local DB."""
         worker_data = {
             "worker_id": worker_id,
             "name": name,
             "department": department,
             "role": role,
+            "biometric_mode": biometric_mode,  # "HOST" (Stored in Firebase) or "DEVICE" (Hardware flash)
+            "host_enrolled": host_enrolled,
+            "faceprint_status": faceprint_status,
             "enrolled_at": datetime.now().isoformat(),
             "image_b64": image_b64,
             "device": "Intel RealSense ID F455"
@@ -56,7 +60,7 @@ class FirebaseService:
         if self.initialized and self.db:
             try:
                 self.db.collection("workers").document(worker_id).set(worker_data)
-                logger.info(f"Saved worker faceprint profile '{worker_id}' to Firebase Firestore.")
+                logger.info(f"Saved worker faceprint profile '{worker_id}' ({biometric_mode} mode) to Firebase Firestore.")
             except Exception as e:
                 logger.error(f"Error saving worker to Firebase: {e}")
 
@@ -87,6 +91,15 @@ class FirebaseService:
                 return {}
         return {}
 
+    def get_worker(self, worker_id: str):
+        workers = self.get_all_workers()
+        return workers.get(worker_id)
+
+    def get_host_workers(self):
+        """Returns all workers registered in Host Mode (Firebase faceprint database)."""
+        workers = self.get_all_workers()
+        return {wid: w for wid, w in workers.items() if w.get("biometric_mode") == "HOST" or w.get("host_enrolled")}
+
     def get_last_punch_status(self, worker_id: str):
         """Returns the last punch type for a worker to toggle PUNCH IN vs PUNCH OUT."""
         logs = self.get_attendance_logs(limit=100)
@@ -95,7 +108,7 @@ class FirebaseService:
                 return log.get("punch_type")
         return "PUNCH_OUT"  # Default to PUNCH_IN for first scan
 
-    def save_punch_event(self, worker_id: str, name: str, punch_type: str, image_b64: str = None, status: str = "SUCCESS", message: str = ""):
+    def save_punch_event(self, worker_id: str, name: str, punch_type: str, image_b64: str = None, status: str = "SUCCESS", message: str = "", auth_mode: str = "HOST"):
         """Saves a Punch-In or Punch-Out attendance record to Firebase."""
         now = datetime.now()
         record = {
@@ -103,6 +116,7 @@ class FirebaseService:
             "name": name or "Worker",
             "punch_type": punch_type,  # "PUNCH_IN" or "PUNCH_OUT"
             "status": status,
+            "auth_mode": auth_mode,    # "HOST" (Firebase Biometrics) or "DEVICE" (Hardware Flash)
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
             "date": now.strftime("%Y-%m-%d"),
             "time": now.strftime("%I:%M:%S %p"),
@@ -114,7 +128,7 @@ class FirebaseService:
         if self.initialized and self.db:
             try:
                 self.db.collection("attendance_logs").add(record)
-                logger.info(f"Saved {punch_type} record for worker {worker_id} to Firebase Firestore.")
+                logger.info(f"Saved {punch_type} record for worker {worker_id} ({auth_mode} mode) to Firebase Firestore.")
             except Exception as e:
                 logger.error(f"Firebase attendance log save error: {e}")
 
