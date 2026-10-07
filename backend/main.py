@@ -75,22 +75,30 @@ class RegisterWorkerRequest(BaseModel):
     name: str
     department: Optional[str] = "General"
     role: Optional[str] = "Worker"
+    biometric_mode: Optional[str] = "HOST"  # "HOST" (Firebase Cloud Faceprints) or "DEVICE" (Hardware Flash)
 
 class ManualPunchRequest(BaseModel):
     mode: Optional[str] = "AUTO"  # "PUNCH_IN", "PUNCH_OUT", or "AUTO"
+    biometric_mode: Optional[str] = "HYBRID"  # "HYBRID", "HOST", or "DEVICE"
 
 # --- API Endpoints ---
 
 @app.get("/api/status")
 def get_status():
     connected, msg = rs_service.check_device_connected()
+    host_users = rs_service.list_host_users()
+    dev_users = rs_service.list_users()
     return {
         "device": "Intel RealSense ID F455",
         "port": rs_service.port,
         "connected": connected,
         "message": msg,
         "is_auto_scanning": rs_service.is_scanning,
-        "firebase_active": fb_service.initialized
+        "firebase_active": fb_service.initialized,
+        "biometric_modes": ["HOST", "DEVICE", "HYBRID"],
+        "active_mode": "PURE_HOST_&_HYBRID",
+        "host_users_count": len(host_users),
+        "device_users_count": len(dev_users)
     }
 
 @app.get("/api/capacity")
@@ -108,8 +116,9 @@ def video_feed():
 
 @app.post("/api/punch")
 def trigger_worker_punch(req: ManualPunchRequest):
-    """Authenticates worker face via Intel F455 and logs PUNCH IN / PUNCH OUT to Firebase."""
-    auth_res = rs_service.authenticate_single()
+    """Authenticates worker face via Intel F455 (Host / Hybrid mode) and logs PUNCH IN / PUNCH OUT to Firebase."""
+    auth_res = rs_service.authenticate_single(mode=req.biometric_mode or "HYBRID")
+    auth_mode = auth_res.get("auth_mode", "HYBRID")
     
     if auth_res.get("status") == "AUTHENTICATED":
         worker_id = auth_res.get("user_id", "Worker")
@@ -129,6 +138,8 @@ def trigger_worker_punch(req: ManualPunchRequest):
         else:
             next_punch = req.mode
 
+        mode_badge = "Firebase Host Mode" if auth_mode == "HOST" else "On-Device Hardware"
+
         # Save Attendance Punch Event to Firebase
         punch_record = fb_service.save_punch_event(
             worker_id=worker_id,
@@ -136,7 +147,8 @@ def trigger_worker_punch(req: ManualPunchRequest):
             punch_type=next_punch,
             image_b64=auth_res.get("image_b64"),
             status="SUCCESS",
-            message=f"Worker {worker_name} ({worker_id}) {next_punch.replace('_', ' ')} verified via Intel F455."
+            auth_mode=auth_mode,
+            message=f"Worker {worker_name} ({worker_id}) {next_punch.replace('_', ' ')} verified via {mode_badge}."
         )
         return {
             "success": True,
@@ -144,6 +156,7 @@ def trigger_worker_punch(req: ManualPunchRequest):
             "punch_type": next_punch,
             "worker_id": worker_id,
             "name": worker_name,
+            "auth_mode": auth_mode,
             "timestamp": punch_record.get("timestamp"),
             "time": punch_record.get("time"),
             "image_b64": auth_res.get("image_b64"),
@@ -157,44 +170,57 @@ def trigger_worker_punch(req: ManualPunchRequest):
             punch_type="DENIED",
             image_b64=auth_res.get("image_b64"),
             status="DENIED",
-            message="Facial authentication failed or unverified face."
+            auth_mode=auth_mode,
+            message=auth_res.get("message") or "Facial authentication failed or unverified face."
         )
         return {
             "success": False,
             "status": "DENIED",
             "punch_type": "DENIED",
+            "auth_mode": auth_mode,
             "worker_id": None,
             "name": "Unknown",
             "timestamp": denied_record.get("timestamp"),
             "image_b64": auth_res.get("image_b64"),
-            "message": "Access Denied: Unrecognized face or spoof attempt."
+            "message": auth_res.get("message") or "Access Denied: Unrecognized face or spoof attempt."
         }
 
 @app.post("/api/workers/register")
 def register_worker(req: RegisterWorkerRequest):
-    """Enrolls worker face in Intel F455 hardware memory and saves profile into Firebase."""
+    """
+    Enrolls worker face:
+    - In Host Mode (Default): Extracts biometric vector from F455 and saves faceprint profile to Firebase.
+    - In Device Mode: Saves profile directly into F455 hardware flash and Firebase metadata.
+    """
     if not req.worker_id or not req.name:
         raise HTTPException(status_code=400, detail="Worker ID and Name are required")
 
-    enroll_res = rs_service.enroll_user(req.worker_id)
+    target_mode = (req.biometric_mode or "HOST").upper()
+    enroll_res = rs_service.enroll_user(req.worker_id, mode=target_mode)
+
     if enroll_res.get("success"):
-        # Save profile metadata into Firebase
+        # Save profile and biometric metadata into Firebase
         worker_profile = fb_service.save_worker_profile(
             worker_id=req.worker_id,
             name=req.name,
             department=req.department,
             role=req.role,
+            biometric_mode=target_mode,
+            host_enrolled=(target_mode == "HOST"),
+            faceprint_status="STORED_IN_FIREBASE" if target_mode == "HOST" else "STORED_ON_HARDWARE_FLASH",
             image_b64=enroll_res.get("image_b64")
         )
         return {
             "success": True,
-            "message": f"Worker '{req.name}' ({req.worker_id}) faceprint saved in Intel F455 and Firebase!",
+            "biometric_mode": target_mode,
+            "message": f"Worker '{req.name}' ({req.worker_id}) faceprint successfully enrolled in {target_mode} Mode and saved to Firebase!",
             "worker": worker_profile
         }
     else:
         return {
             "success": False,
-            "message": enroll_res.get("message") or "Failed to capture face on Intel F455 hardware."
+            "biometric_mode": target_mode,
+            "message": enroll_res.get("message") or f"Failed to capture face on Intel F455 in {target_mode} mode."
         }
 
 @app.get("/api/attendance")

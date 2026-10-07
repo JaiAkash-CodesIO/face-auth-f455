@@ -29,6 +29,9 @@
         <div class="status-chip" style="border-color: rgba(6, 182, 212, 0.3);">
           <span>🔥 Firebase Cloud: <strong id="firebaseStatusText">Active</strong></span>
         </div>
+        <div class="status-chip" style="border-color: rgba(168, 85, 247, 0.35);">
+          <span>🧬 Biometric: <strong id="biometricModeText" style="color: #a855f7;">Host Mode (Firebase)</strong></span>
+        </div>
       </div>
     </header>
 
@@ -56,6 +59,10 @@
           <div class="meta-item">
             <span class="key">Punch Time</span>
             <span id="metaTime" class="val">--</span>
+          </div>
+          <div class="meta-item">
+            <span class="key">Biometric Mode</span>
+            <span id="metaMode" class="val">--</span>
           </div>
           <div class="meta-item">
             <span class="key">Action Result</span>
@@ -92,9 +99,16 @@
     <!-- Metrics Cards -->
     <section class="metrics-grid">
       <div class="metric-card">
+        <div class="metric-icon purple">🧬</div>
+        <div class="metric-info">
+          <h4>Host Cloud Workers</h4>
+          <p id="statHostUsers">0 Enrolled</p>
+        </div>
+      </div>
+      <div class="metric-card">
         <div class="metric-icon blue">💾</div>
         <div class="metric-info">
-          <h4>F455 Capacity Left</h4>
+          <h4>F455 Flash Capacity</h4>
           <p id="statRemainingSlots">1,000 / 1,000</p>
         </div>
       </div>
@@ -110,13 +124,6 @@
         <div class="metric-info">
           <h4>Total Punch-Outs</h4>
           <p id="statPunchOuts">0</p>
-        </div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-icon purple">🔥</div>
-        <div class="metric-info">
-          <h4>Firebase Sync</h4>
-          <p id="statFirebaseLogs">Live</p>
         </div>
       </div>
     </section>
@@ -138,7 +145,7 @@
               <th>Date & Time</th>
               <th>Punch Action</th>
               <th>Worker ID & Name</th>
-              <th>Hardware Device</th>
+              <th>Biometric Auth Mode</th>
               <th>Verification Message</th>
             </tr>
           </thead>
@@ -159,14 +166,21 @@
     <div class="modal-content">
       <h3 style="font-size: 1.25rem;">Register New Worker</h3>
       <p style="font-size: 0.88rem; color: var(--text-muted);">
-        Enter worker details. The Intel F455 camera will capture the faceprint and upload profile to Firebase Cloud.
+        Enter worker details. The Intel F455 camera will capture the faceprint and store the profile in Firebase Cloud.
       </p>
+      
+      <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-top: 10px; margin-bottom: 4px;">Biometric Mode</label>
+      <select id="regBiometricMode" class="input-field" style="margin-bottom: 12px; cursor: pointer; background: var(--bg-card); color: var(--text-main);">
+        <option value="HOST" selected>🔥 Pure Host Mode (Faceprint Stored in Firebase Cloud)</option>
+        <option value="DEVICE">💾 On-Device Mode (Faceprint Stored in F455 Hardware Flash)</option>
+      </select>
+
       <input type="text" id="regWorkerId" class="input-field" placeholder="Worker ID (e.g. W_101)">
       <input type="text" id="regName" class="input-field" placeholder="Full Name (e.g. Govardhan)">
       <input type="text" id="regDepartment" class="input-field" placeholder="Department (e.g. Construction / IT)">
       <input type="text" id="regRole" class="input-field" placeholder="Role (e.g. Supervisor / Engineer)">
       
-      <div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 10px;">
+      <div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 14px;">
         <button id="btnCloseModal" class="btn btn-secondary">Cancel</button>
         <button id="btnSubmitRegister" class="btn btn-primary">Capture & Save Faceprint</button>
       </div>
