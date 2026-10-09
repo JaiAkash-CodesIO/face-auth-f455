@@ -107,10 +107,15 @@ def get_capacity():
     return rs_service.get_capacity_info()
 
 @app.get("/api/video_feed")
-def video_feed():
+async def video_feed():
     """Live MJPEG video stream from Intel RealSense F455 camera."""
+    async def async_frame_stream():
+        for frame in rs_service.generate_video_feed():
+            yield frame
+            await asyncio.sleep(0.001)
+
     return StreamingResponse(
-        rs_service.generate_video_feed(),
+        async_frame_stream(),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
