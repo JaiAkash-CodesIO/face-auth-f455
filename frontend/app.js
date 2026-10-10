@@ -365,8 +365,10 @@ async function submitRegistration() {
       regWorkerId.value = "";
       regName.value = "";
     } else {
-      updateBanner("state-denied", "REGISTRATION FAILED", data.message || "Failed to capture face.", `${name} (${wId})`, new Date().toLocaleTimeString(), "FAILED", null, bioMode);
-      showToast("Registration Failed", data.message || "Face not detected", "error");
+      const isDuplicate = data.status && data.status.startsWith("DUPLICATE");
+      const title = isDuplicate ? "⛔ DUPLICATE ENROLLMENT REJECTED" : "REGISTRATION FAILED";
+      updateBanner("state-denied", title, data.message || "Failed to capture face.", `${name} (${wId})`, new Date().toLocaleTimeString(), isDuplicate ? "DUPLICATE" : "FAILED", null, bioMode);
+      showToast(isDuplicate ? "Duplicate Face Detected" : "Registration Failed", data.message || "Face not detected", "error", 5500);
     }
     fetchInitialLogs();
     fetchCapacityInfo();

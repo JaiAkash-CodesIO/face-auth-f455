@@ -266,6 +266,51 @@ class RealSenseService:
 
             return result
 
+    def check_duplicate_face(self, mode: str = "HOST") -> dict:
+        """
+        Performs a pre-enrollment 1:N de-duplication scan without triggering
+        attendance punch callbacks or broadcast events.
+        Checks if the face presented to the camera already belongs to any enrolled worker.
+        """
+        if not os.path.exists(self.cli_path):
+            return {"is_duplicate": False, "matched_user_id": None, "mode": None}
+
+        with self.hardware_lock:
+            mode_upper = (mode or "HOST").upper()
+
+            # 1. Check Host Mode database if host users exist
+            if mode_upper in ("HOST", "HYBRID"):
+                host_users = self.list_host_users()
+                if host_users:
+                    host_res = self.authenticate_host()
+                    if host_res.get("success") and host_res.get("user_id"):
+                        return {
+                            "is_duplicate": True,
+                            "matched_user_id": host_res.get("user_id"),
+                            "mode": "HOST",
+                            "message": f"Face matches enrolled Host worker '{host_res.get('user_id')}'"
+                        }
+
+            # 2. Check On-Device hardware flash if device users exist
+            if mode_upper in ("DEVICE", "HYBRID"):
+                dev_users = self.list_users()
+                if dev_users:
+                    dev_res = self.authenticate_device()
+                    if dev_res.get("success") and dev_res.get("user_id"):
+                        return {
+                            "is_duplicate": True,
+                            "matched_user_id": dev_res.get("user_id"),
+                            "mode": "DEVICE",
+                            "message": f"Face matches enrolled Hardware worker '{dev_res.get('user_id')}'"
+                        }
+
+            return {
+                "is_duplicate": False,
+                "matched_user_id": None,
+                "mode": None,
+                "message": "No duplicate face detected."
+            }
+
     def enroll_user_host(self, user_id: str) -> dict:
         """Enrolls a user in Host Mode ('E') by extracting faceprint vector into host session."""
         cmd = f"E\n{user_id}"

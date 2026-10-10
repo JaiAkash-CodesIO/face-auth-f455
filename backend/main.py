@@ -193,14 +193,47 @@ def trigger_worker_punch(req: ManualPunchRequest):
 @app.post("/api/workers/register")
 def register_worker(req: RegisterWorkerRequest):
     """
-    Enrolls worker face:
-    - In Host Mode (Default): Extracts biometric vector from F455 and saves faceprint profile to Firebase.
-    - In Device Mode: Saves profile directly into F455 hardware flash and Firebase metadata.
+    Enrolls worker face with pre-enrollment 1:N de-duplication verification:
+    1. Checks if worker_id is already assigned in Firebase.
+    2. Performs a pre-auth biometric scan ('A'/'a') to verify if the physical face is already enrolled.
+    3. If no duplicate is detected, captures faceprint vectors and saves profile to Firebase.
     """
     if not req.worker_id or not req.name:
         raise HTTPException(status_code=400, detail="Worker ID and Name are required")
 
     target_mode = (req.biometric_mode or "HOST").upper()
+
+    # 1. Check if the Worker ID is already assigned in Firebase
+    existing_worker = fb_service.get_worker(req.worker_id)
+    if existing_worker:
+        existing_name = existing_worker.get("name", "Existing Worker")
+        return {
+            "success": False,
+            "status": "DUPLICATE_ID",
+            "biometric_mode": target_mode,
+            "message": f"Registration Rejected: Worker ID '{req.worker_id}' is already registered to '{existing_name}'."
+        }
+
+    # 2. Pre-Enrollment Biometric De-duplication Check (1:N Anti-Duplication)
+    duplicate_check = rs_service.check_duplicate_face(mode=target_mode)
+    if duplicate_check.get("is_duplicate") and duplicate_check.get("matched_user_id"):
+        matched_id = duplicate_check.get("matched_user_id")
+        all_workers = fb_service.get_all_workers()
+        matched_worker = all_workers.get(matched_id, {})
+        matched_name = matched_worker.get("name", matched_id)
+        matched_mode = duplicate_check.get("mode", target_mode)
+
+        logging.warning(f"Duplicate enrollment prevented: face matches '{matched_name}' ({matched_id})")
+        return {
+            "success": False,
+            "status": "DUPLICATE_FACE",
+            "biometric_mode": target_mode,
+            "matched_worker_id": matched_id,
+            "matched_name": matched_name,
+            "message": f"Duplicate Enrollment Rejected: This face is already enrolled as '{matched_name}' (ID: {matched_id}) in {matched_mode} Mode!"
+        }
+
+    # 3. Proceed with enrollment since no duplicate exists
     enroll_res = rs_service.enroll_user(req.worker_id, mode=target_mode)
 
     if enroll_res.get("success"):
