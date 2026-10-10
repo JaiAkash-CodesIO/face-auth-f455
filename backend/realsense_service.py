@@ -2,6 +2,7 @@ import os
 import subprocess
 import time
 import re
+import json
 import threading
 import logging
 import base64
@@ -11,14 +12,15 @@ logger = logging.getLogger("realsense_service")
 logging.basicConfig(level=logging.INFO)
 
 RSID_CLI_PATH = r"C:\Users\govar\AppData\Local\Programs\RealSenseID Tools\rsid-cli.exe"
-
-import queue
+BRIDGE_PS1_PATH = os.path.join(os.path.dirname(__file__), "rsid_native_bridge.ps1")
 
 class RealSenseService:
-    def __init__(self, port="COM4", device_type="F45x"):
+    def __init__(self, port="COM4", device_type="F45x", fb_service=None):
         self.port = port
         self.device_type = device_type
         self.cli_path = RSID_CLI_PATH
+        self.bridge_path = BRIDGE_PS1_PATH
+        self.fb_service = fb_service
         self.is_scanning = False
         self._scan_thread = None
         self._on_auth_callback = None
@@ -27,169 +29,152 @@ class RealSenseService:
         self.cli_release_event = threading.Event()
         self.last_frame = None
 
-        # Persistent CLI Session for high-performance Host & Device Biometrics
-        self._session_proc = None
-        self._session_queue = None
-        self._session_thread = None
+        # Auto-detect COM port if available
+        self.detect_com_port()
+
+    def set_firebase_service(self, fb_service):
+        self.fb_service = fb_service
 
     def set_auth_callback(self, callback):
         self._on_auth_callback = callback
 
-    def _ensure_session(self):
-        """Ensures the background rsid-cli process is running and ready to accept commands."""
-        if not os.path.exists(self.cli_path):
-            return False
-
-        if self._session_proc is not None and self._session_proc.poll() is None:
-            return True
-
-        # Clean up any dead process
-        self._close_session()
-
+    def detect_com_port(self) -> str:
+        """Automatically detects the active COM port of the Intel RealSense ID F455."""
         try:
-            cmd = [self.cli_path, "--port", self.port, "--device-type", self.device_type]
-            self._session_proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-            self._session_queue = queue.Queue()
-
-            def _reader():
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM")
+            ports = []
+            i = 0
+            while True:
                 try:
-                    for line in iter(self._session_proc.stdout.readline, ''):
-                        if self._session_queue:
-                            self._session_queue.put(line)
-                except Exception:
-                    pass
+                    val_name, val_data, _ = winreg.EnumValue(key, i)
+                    ports.append(val_data)
+                    i += 1
+                except OSError:
+                    break
+            winreg.CloseKey(key)
 
-            self._session_thread = threading.Thread(target=_reader, daemon=True)
-            self._session_thread.start()
-
-            # Wait briefly to consume startup banner
-            start_wait = time.time()
-            while time.time() - start_wait < 1.5:
-                try:
-                    line = self._session_queue.get(timeout=0.1)
-                    if "[?]" in line or "Choose an option" in line:
-                        break
-                except queue.Empty:
-                    continue
-            return True
+            if ports:
+                # If current port is in list, keep it; otherwise switch to first available
+                if self.port not in ports:
+                    self.port = ports[0]
+                    logger.info(f"Updated RealSense COM port to: {self.port}")
+                return self.port
         except Exception as e:
-            logger.error(f"Error starting rsid-cli session: {e}")
-            self._close_session()
-            return False
+            logger.debug(f"Error reading SERIALCOMM: {e}")
+        return self.port
 
     def _close_session(self):
-        """Safely shuts down the background CLI process."""
-        if self._session_proc:
-            try:
-                self._session_proc.stdin.write("q\n")
-                self._session_proc.stdin.flush()
-                self._session_proc.wait(timeout=1.5)
-            except Exception:
-                try:
-                    self._session_proc.kill()
-                except Exception:
-                    pass
-        self._session_proc = None
-        self._session_queue = None
-        self._session_thread = None
+        """No-op kept for backwards compatibility."""
+        pass
 
-    def _exec_command(self, cmd_input: str, end_markers: list, timeout: float = 8.0) -> str:
-        """Sends command to CLI session and gathers response until an end marker is seen."""
-        if not self._ensure_session():
-            return ""
+    def _run_bridge_command(self, command: str, param: str = "", timeout: float = 15.0) -> dict:
+        """Executes a biometric operation via the native C# SDK bridge."""
+        if not os.path.exists(self.bridge_path):
+            logger.error(f"Native bridge not found at {self.bridge_path}")
+            return {"success": False, "error": f"Bridge script not found at {self.bridge_path}"}
 
-        # Flush any leftover output from queue
-        while not self._session_queue.empty():
-            try:
-                self._session_queue.get_nowait()
-            except Exception:
-                break
+        # Ensure active COM port is up-to-date
+        self.detect_com_port()
+
+        cmd = [
+            "powershell",
+            "-ExecutionPolicy", "Bypass",
+            "-File", self.bridge_path,
+            command,
+            self.port,
+            param
+        ]
 
         try:
-            self._session_proc.stdin.write(cmd_input + "\n")
-            self._session_proc.stdin.flush()
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            
+            # Parse JSON from stdout lines (reverse order to find output JSON)
+            for line in reversed(stdout.splitlines()):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        return json.loads(line)
+                    except Exception:
+                        continue
+
+            logger.warning(f"Bridge command '{command}' returned non-JSON stdout:\n{stdout}\nstderr:\n{stderr}")
+            return {"success": False, "error": f"No valid JSON output from bridge. Output: {stdout[:150]}"}
+        except subprocess.TimeoutExpired:
+            logger.error(f"Bridge command '{command}' timed out after {timeout}s")
+            return {"success": False, "error": f"Native bridge operation '{command}' timed out"}
         except Exception as e:
-            logger.warning(f"Session pipe write error ({e}). Restarting session...")
-            self._close_session()
-            if not self._ensure_session():
-                return ""
-            self._session_proc.stdin.write(cmd_input + "\n")
-            self._session_proc.stdin.flush()
-
-        lines = []
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                line = self._session_queue.get(timeout=0.1)
-                lines.append(line)
-                if any(m.lower() in line.lower() for m in end_markers):
-                    break
-            except queue.Empty:
-                continue
-
-        output = "".join(lines)
-        logger.info(f"[CLI Session Output for '{cmd_input}']:\n{output}")
-        return output
+            logger.error(f"Bridge command '{command}' error: {e}")
+            return {"success": False, "error": str(e)}
 
     def check_device_connected(self):
-        """Check if RSID CLI can reach the device on COM port."""
-        if not os.path.exists(self.cli_path):
-            return False, f"CLI binary not found at {self.cli_path}"
-
+        """Check if RSID native bridge can reach the device on COM port."""
         with self.hardware_lock:
-            try:
-                output = self._exec_command("U", ["[?]", "users\n"], timeout=4)
-                if "Using port: COM4" in output or "users" in output.lower():
-                    return True, f"Connected to RealSense ID F455 on {self.port}"
-                return False, "Failed to connect to F455"
-            except Exception as e:
-                return False, str(e)
+            self.detect_com_port()
+            res = self._run_bridge_command("users_device", timeout=8.0)
+            if res.get("success"):
+                return True, f"Connected to RealSense ID F455 on {self.port}"
+            return False, res.get("error", f"Failed to connect to F455 on {self.port}")
 
     def authenticate_host(self) -> dict:
-        """Executes Host Mode authentication ('A') matching against host faceprints."""
-        output = self._exec_command("A", ["[?]", "Match success", "Forbidden", "failed with status"], timeout=8)
-        
-        if "match success" in output.lower():
-            match = re.search(r"match success\.\s*user(?:_id)?:\s*([^\*\r\n]+)", output, re.IGNORECASE)
-            user_id = match.group(1).strip() if match else "Verified Host Worker"
-            return {
-                "success": True,
-                "status": "AUTHENTICATED",
-                "mode": "HOST",
-                "user_id": user_id,
-                "message": f"Host biometric faceprint match verified for '{user_id}'"
-            }
-        elif "forbidden" in output.lower():
+        """Executes Host Mode authentication matching against Firestore faceprint vectors via Native SDK."""
+        vectors = []
+        if self.fb_service:
+            vectors = self.fb_service.get_all_faceprint_vectors()
+
+        if not vectors:
             return {
                 "success": False,
-                "status": "DENIED",
+                "status": "NO_USERS",
                 "mode": "HOST",
                 "user_id": None,
-                "message": "Host Mode: Face not recognized in host faceprint database"
+                "message": "Host Mode: No enrolled host faceprints in Firebase cloud database"
             }
-        else:
-            return {
-                "success": False,
-                "status": "DENIED",
-                "mode": "HOST",
-                "user_id": None,
-                "message": "Host Mode: Face extraction failed or no face detected"
-            }
+
+        cache_path = os.path.join(os.path.dirname(__file__), "host_db_cache.json")
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(vectors, f)
+
+            res = self._run_bridge_command("match", cache_path, timeout=12.0)
+            if res.get("success"):
+                user_id = res.get("user_id")
+                score = res.get("score", 0)
+                return {
+                    "success": True,
+                    "status": "AUTHENTICATED",
+                    "mode": "HOST",
+                    "user_id": user_id,
+                    "score": score,
+                    "message": f"Host biometric faceprint match verified for '{user_id}' (Score: {score})"
+                }
+            else:
+                return {
+                    "success": False,
+                    "status": res.get("status", "DENIED"),
+                    "mode": "HOST",
+                    "user_id": None,
+                    "message": res.get("error") or "Host Mode: Face not recognized in cloud faceprint database"
+                }
+        finally:
+            if os.path.exists(cache_path):
+                try:
+                    os.remove(cache_path)
+                except Exception:
+                    pass
 
     def authenticate_device(self) -> dict:
-        """Executes On-Device hardware authentication ('a') matching against F455 hardware flash."""
-        output = self._exec_command("a", ["[?]", "authenticate success", "got result:", "status:"], timeout=8)
-
-        if "authenticate success" in output.lower() or "got result: success" in output.lower():
-            match = re.search(r"user(?:_id)?:\s*([^\*\r\n]+)", output, re.IGNORECASE)
-            user_id = match.group(1).strip() if match else "Jai Akash"
+        """Executes On-Device hardware authentication matching against F455 hardware flash."""
+        res = self._run_bridge_command("auth_device", timeout=10.0)
+        if res.get("success"):
+            user_id = res.get("user_id") or "Jai Akash"
             return {
                 "success": True,
                 "status": "AUTHENTICATED",
@@ -203,23 +188,16 @@ class RealSenseService:
                 "status": "DENIED",
                 "mode": "DEVICE",
                 "user_id": None,
-                "message": "On-Device: Face not recognized or spoof detected by Intel F455 hardware"
+                "message": res.get("error") or "On-Device: Face not recognized or spoof detected by Intel F455 hardware"
             }
 
     def authenticate_single(self, mode: str = "HYBRID"):
         """
         Runs facial authentication. Supports:
-        - 'HOST': Uses Host Mode faceprints ('A')
-        - 'DEVICE': Uses On-Device hardware memory ('a')
-        - 'HYBRID' / 'AUTO': Tries Host Mode first; falls back to On-Device memory if needed.
+        - 'HOST': Uses Host Mode faceprints matched against Firebase Firestore vectors
+        - 'DEVICE': Uses On-Device hardware memory
+        - 'HYBRID' / 'AUTO': Tries Host Mode first; falls back to On-Device hardware flash if needed.
         """
-        if not os.path.exists(self.cli_path):
-            return {
-                "success": False,
-                "status": "CLI_NOT_FOUND",
-                "message": f"RealSense CLI tool missing at {self.cli_path}"
-            }
-
         with self.hardware_lock:
             auth_res = None
             mode_upper = (mode or "HYBRID").upper()
@@ -229,7 +207,7 @@ class RealSenseService:
             elif mode_upper == "DEVICE":
                 auth_res = self.authenticate_device()
             else:  # HYBRID / AUTO mode
-                # Try Host Mode first
+                # Try Host Mode (Firestore Cloud Vectors) first
                 host_res = self.authenticate_host()
                 if host_res.get("success"):
                     auth_res = host_res
@@ -272,13 +250,10 @@ class RealSenseService:
         attendance punch callbacks or broadcast events.
         Checks if the face presented to the camera already belongs to any enrolled worker.
         """
-        if not os.path.exists(self.cli_path):
-            return {"is_duplicate": False, "matched_user_id": None, "mode": None}
-
         with self.hardware_lock:
             mode_upper = (mode or "HOST").upper()
 
-            # 1. Check Host Mode database if host users exist
+            # 1. Check Host Mode database if host users exist in Firestore
             if mode_upper in ("HOST", "HYBRID"):
                 host_users = self.list_host_users()
                 if host_users:
@@ -312,25 +287,19 @@ class RealSenseService:
             }
 
     def enroll_user_host(self, user_id: str) -> dict:
-        """Enrolls a user in Host Mode ('E') by extracting faceprint vector into host session."""
-        cmd = f"E\n{user_id}"
-        output = self._exec_command(cmd, ["[?]", "Status: Ok", "on_result:"], timeout=12)
-
-        if "got faceprints from device" in output.lower() or "on_result: status: success" in output.lower() or "status: ok" in output.lower():
+        """Enrolls a user in Host Mode by extracting 512-D faceprint vector into Firebase."""
+        res = self._run_bridge_command("enroll", user_id, timeout=15.0)
+        if res.get("success"):
             return {
                 "success": True,
                 "status": "ENROLLED",
                 "mode": "HOST",
                 "user_id": user_id,
+                "vector": res.get("vector"),
+                "version": res.get("version", 1),
+                "featuresType": res.get("featuresType", 0),
+                "flags": res.get("flags", 0),
                 "message": f"Biometric faceprint extracted successfully for '{user_id}' and ready for Firebase Cloud storage."
-            }
-        elif "duplicate" in output.lower():
-            return {
-                "success": False,
-                "status": "DUPLICATE",
-                "mode": "HOST",
-                "user_id": user_id,
-                "message": f"Faceprint for '{user_id}' already enrolled in Host database."
             }
         else:
             return {
@@ -338,15 +307,13 @@ class RealSenseService:
                 "status": "FAILED",
                 "mode": "HOST",
                 "user_id": user_id,
-                "message": "Host faceprint extraction failed. Center face 40-70cm from F455 lens."
+                "message": res.get("error") or "Host faceprint extraction failed. Center face 40-70cm from F455 lens."
             }
 
     def enroll_user_device(self, user_id: str) -> dict:
-        """Enrolls a user in On-Device hardware flash memory ('e')."""
-        cmd = f"e\n{user_id}"
-        output = self._exec_command(cmd, ["[?]", "enroll success", "duplicatefaceprints", "got result:"], timeout=12)
-
-        if "enroll success" in output.lower() or "got result: success" in output.lower():
+        """Enrolls a user in On-Device hardware flash memory."""
+        res = self._run_bridge_command("enroll_device", user_id, timeout=15.0)
+        if res.get("success"):
             return {
                 "success": True,
                 "status": "ENROLLED",
@@ -354,21 +321,13 @@ class RealSenseService:
                 "user_id": user_id,
                 "message": f"Face profile '{user_id}' successfully saved in F455 hardware flash memory."
             }
-        elif "duplicate" in output.lower():
-            return {
-                "success": False,
-                "status": "DUPLICATE",
-                "mode": "DEVICE",
-                "user_id": user_id,
-                "message": "Faceprint is already enrolled in Intel F455 hardware flash memory."
-            }
         else:
             return {
                 "success": False,
                 "status": "FAILED",
                 "mode": "DEVICE",
                 "user_id": user_id,
-                "message": "Hardware enrollment failed on Intel F455 device."
+                "message": res.get("error") or "Hardware enrollment failed on Intel F455 device."
             }
 
     def enroll_user(self, user_id: str, mode: str = "HOST"):
@@ -395,55 +354,30 @@ class RealSenseService:
 
     def list_users(self):
         """Lists all enrolled user IDs from the F455 hardware flash memory."""
-        if not os.path.exists(self.cli_path):
-            return []
-
-        with self.hardware_lock:
-            users = []
-            try:
-                out = self._exec_command("u", ["[?]"], timeout=5)
-                for line in out.splitlines():
-                    match = re.match(r"^\d+\.\s*(.+)$", line.strip())
-                    if match:
-                        user_name = match.group(1).strip()
-                        if user_name:
-                            users.append(user_name)
-            except Exception as e:
-                logger.error(f"Error listing hardware users: {e}")
-            return users
+        res = self._run_bridge_command("users_device", timeout=8.0)
+        if res.get("success"):
+            return res.get("users", [])
+        return []
 
     def list_host_users(self):
-        """Lists all enrolled user IDs from Host Mode database."""
-        if not os.path.exists(self.cli_path):
-            return []
-
-        with self.hardware_lock:
-            host_users = []
-            try:
-                out = self._exec_command("U", ["[?]"], timeout=5)
-                for line in out.splitlines():
-                    match = re.match(r"^\*\s*(.+)$", line.strip())
-                    if match:
-                        user_name = match.group(1).strip()
-                        if user_name:
-                            host_users.append(user_name)
-            except Exception as e:
-                logger.error(f"Error listing host users: {e}")
-            return host_users
+        """Lists all enrolled user IDs from Host Mode (Firebase faceprint database)."""
+        if self.fb_service:
+            return list(self.fb_service.get_host_workers().keys())
+        return []
 
     def get_capacity_info(self, force_refresh=False):
         """Returns max capacity, hardware users, host users, and remaining slots left."""
         now = time.time()
         if not force_refresh and hasattr(self, '_capacity_cache') and self._capacity_cache:
             cache_time, data = self._capacity_cache
-            if now - cache_time < 30.0:
+            if now - cache_time < 15.0:
                 return data
 
         dev_users = self.list_users()
         host_users = self.list_host_users()
         max_cap = 1000
         enrolled_count = len(dev_users)
-        remaining = max_cap - enrolled_count
+        remaining = max(0, max_cap - enrolled_count)
         data = {
             "max_capacity": max_cap,
             "enrolled_count": enrolled_count,
@@ -456,20 +390,27 @@ class RealSenseService:
         return data
 
     def get_intel_camera_index(self):
-        """Directly detects and returns the Intel RealSense camera index."""
+        """
+        Directly detects and returns the Intel RealSense camera index.
+        Explicitly excludes laptop webcams so only the Intel camera is used.
+        """
         try:
             from pygrabber.dshow_graph import FilterGraph
             graph = FilterGraph()
             devices = graph.get_input_devices()
             for idx, name in enumerate(devices):
-                if "intel" in name.lower() or "f450" in name.lower() or "f455" in name.lower():
+                name_lower = name.lower()
+                # Exclude internal / laptop webcams
+                if "integrated" in name_lower or "internal" in name_lower or ("webcam" in name_lower and "intel" not in name_lower):
+                    continue
+                if "intel" in name_lower or "f450" in name_lower or "f455" in name_lower or "realsense" in name_lower:
                     return idx
-        except Exception:
-            pass
-        return 0
+        except Exception as e:
+            logger.debug(f"Error enumerating camera devices: {e}")
+        return None
 
     def capture_snapshot_b64(self, camera_index=None):
-        """Captures a single camera frame snapshot from cache or camera device."""
+        """Captures a single camera frame snapshot strictly from the Intel camera (never laptop webcam)."""
         if self.last_frame is not None:
             try:
                 frame_resized = cv2.resize(self.last_frame, (640, 480))
@@ -482,6 +423,9 @@ class RealSenseService:
 
         if camera_index is None:
             camera_index = self.get_intel_camera_index()
+
+        if camera_index is None:
+            return None
 
         try:
             cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
@@ -506,30 +450,65 @@ class RealSenseService:
             return None
 
     def generate_video_feed(self, camera_index=None):
-        """Generates MJPEG video stream bytes from the Intel camera continuously with live timestamp."""
-        if camera_index is None:
-            camera_index = self.get_intel_camera_index()
-
-        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(camera_index)
-
+        """
+        Generates MJPEG video stream bytes strictly from the Intel RealSense camera.
+        Never falls back to laptop webcam. If Intel camera is not detected, displays
+        a status overlay while polling for device reconnection.
+        """
+        import numpy as np
+        cap = None
         consecutive_fails = 0
 
         try:
             while True:
-                if not cap.isOpened():
-                    cap.open(camera_index, cv2.CAP_DSHOW)
-                    if not cap.isOpened():
-                        cap.open(camera_index)
+                if camera_index is None:
+                    camera_index = self.get_intel_camera_index()
 
-                ret, frame = cap.read()
+                # If Intel camera is not found, display informative RealSense standby overlay
+                if camera_index is None:
+                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    frame[:] = (20, 24, 39) # Dark slate theme
+
+                    current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+                    active_port = self.detect_com_port()
+
+                    # Header badge
+                    cv2.rectangle(frame, (20, 20), (620, 58), (30, 41, 59), -1)
+                    cv2.putText(frame, f"INTEL REALSENSE ID F455  |  {current_time}", (35, 45),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 180, 0), 2)
+
+                    # Center warning icon & message
+                    cv2.putText(frame, "INTEL F455 VIDEO NOT DETECTED", (110, 210),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 165, 255), 2)
+                    cv2.putText(frame, "Laptop camera blocked to protect Intel privacy.", (130, 250),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 174, 192), 1)
+                    cv2.putText(frame, "Please connect Intel F455 to a USB 3.0 / USB-C SuperSpeed port.", (75, 280),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+                    cv2.putText(frame, f"Biometric Sensor Status: Active on {active_port}", (145, 330),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 1)
+
+                    ret_enc, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if ret_enc:
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+                    time.sleep(1.0)
+                    continue
+
+                # Intel Camera detected: Open video capture
+                if cap is None or not cap.isOpened():
+                    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+                    if not cap.isOpened():
+                        cap = cv2.VideoCapture(camera_index)
+
+                ret, frame = cap.read() if cap.isOpened() else (False, None)
                 if not ret or frame is None:
                     consecutive_fails += 1
                     if consecutive_fails > 10:
-                        cap.release()
-                        time.sleep(0.2)
-                        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+                        if cap is not None:
+                            cap.release()
+                            cap = None
+                        camera_index = None # Re-detect
                         consecutive_fails = 0
                     time.sleep(0.04)
                     continue
@@ -553,4 +532,3 @@ class RealSenseService:
         finally:
             if cap is not None and cap.isOpened():
                 cap.release()
-

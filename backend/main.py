@@ -24,8 +24,8 @@ app.add_middleware(
 )
 
 # Initialize Services
-rs_service = RealSenseService(port="COM4", device_type="F45x")
 fb_service = FirebaseService()
+rs_service = RealSenseService(port="COM4", device_type="F45x", fb_service=fb_service)
 
 # WebSocket Manager for Live Broadcasting
 class ConnectionManager:
@@ -54,6 +54,38 @@ main_loop = None
 async def startup_event():
     global main_loop
     main_loop = asyncio.get_running_loop()
+    # Auto-sync any on-device hardware faceprints into Firestore in background thread
+    def _bg_sync():
+        try:
+            import time
+            time.sleep(1.0)
+            dev_prints = rs_service._run_bridge_command("get_device_faceprints")
+            if dev_prints.get("success"):
+                for u in dev_prints.get("users", []):
+                    wid = u.get("worker_id")
+                    vec = u.get("vector")
+                    if wid and vec:
+                        existing = fb_service.get_worker(wid)
+                        if not existing or not existing.get("faceprint_vector"):
+                            fb_service.save_worker_profile(
+                                worker_id=wid,
+                                name=existing.get("name", wid) if existing else wid,
+                                department=existing.get("department", "General") if existing else "General",
+                                role=existing.get("role", "Worker") if existing else "Worker",
+                                biometric_mode="HOST",
+                                host_enrolled=True,
+                                faceprint_status="STORED_IN_FIREBASE",
+                                faceprint_vector=vec,
+                                vector_version=u.get("version", 9),
+                                features_type=u.get("featuresType", 0),
+                                flags=u.get("flags", 0)
+                            )
+                            logging.info(f"Auto-synced hardware faceprint vector for '{wid}' into Firestore.")
+        except Exception as e:
+            logging.warning(f"Startup hardware faceprint sync skipped: {e}")
+
+    import threading
+    threading.Thread(target=_bg_sync, daemon=True).start()
 
 # Hook real-time auth callback to push to Firebase and WebSocket subscribers
 def on_auth_event(event: dict):
@@ -76,6 +108,7 @@ class RegisterWorkerRequest(BaseModel):
     department: Optional[str] = "General"
     role: Optional[str] = "Worker"
     biometric_mode: Optional[str] = "HOST"  # "HOST" (Firebase Cloud Faceprints) or "DEVICE" (Hardware Flash)
+    overwrite: Optional[bool] = False
 
 class ManualPunchRequest(BaseModel):
     mode: Optional[str] = "AUTO"  # "PUNCH_IN", "PUNCH_OUT", or "AUTO"
@@ -86,8 +119,8 @@ class ManualPunchRequest(BaseModel):
 @app.get("/api/status")
 def get_status():
     connected, msg = rs_service.check_device_connected()
-    host_users = rs_service.list_host_users()
     dev_users = rs_service.list_users()
+    host_workers = fb_service.get_host_workers()
     return {
         "device": "Intel RealSense ID F455",
         "port": rs_service.port,
@@ -97,25 +130,24 @@ def get_status():
         "firebase_active": fb_service.initialized,
         "biometric_modes": ["HOST", "DEVICE", "HYBRID"],
         "active_mode": "PURE_HOST_&_HYBRID",
-        "host_users_count": len(host_users),
+        "host_users_count": len(host_workers),
         "device_users_count": len(dev_users)
     }
 
 @app.get("/api/capacity")
 def get_capacity():
-    """Returns total capacity, currently enrolled users count, and remaining slots left."""
-    return rs_service.get_capacity_info()
+    """Returns total capacity, hardware flash users count, and Firebase Cloud enrolled count."""
+    cap = rs_service.get_capacity_info()
+    host_workers = fb_service.get_host_workers()
+    cap["host_enrolled_count"] = len(host_workers)
+    cap["host_users"] = list(host_workers.keys())
+    return cap
 
 @app.get("/api/video_feed")
-async def video_feed():
+def video_feed():
     """Live MJPEG video stream from Intel RealSense F455 camera."""
-    async def async_frame_stream():
-        for frame in rs_service.generate_video_feed():
-            yield frame
-            await asyncio.sleep(0.001)
-
     return StreamingResponse(
-        async_frame_stream(),
+        rs_service.generate_video_feed(),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
@@ -206,32 +238,35 @@ def register_worker(req: RegisterWorkerRequest):
     # 1. Check if the Worker ID is already assigned in Firebase
     existing_worker = fb_service.get_worker(req.worker_id)
     if existing_worker:
-        existing_name = existing_worker.get("name", "Existing Worker")
-        return {
-            "success": False,
-            "status": "DUPLICATE_ID",
-            "biometric_mode": target_mode,
-            "message": f"Registration Rejected: Worker ID '{req.worker_id}' is already registered to '{existing_name}'."
-        }
+        existing_vec = existing_worker.get("faceprint_vector") or []
+        if len(existing_vec) > 0 and not req.overwrite:
+            existing_name = existing_worker.get("name", "Existing Worker")
+            return {
+                "success": False,
+                "status": "DUPLICATE_ID",
+                "biometric_mode": target_mode,
+                "message": f"Registration Rejected: Worker ID '{req.worker_id}' is already registered to '{existing_name}'. (Pass overwrite=true to re-enroll)."
+            }
 
     # 2. Pre-Enrollment Biometric De-duplication Check (1:N Anti-Duplication)
     duplicate_check = rs_service.check_duplicate_face(mode=target_mode)
     if duplicate_check.get("is_duplicate") and duplicate_check.get("matched_user_id"):
         matched_id = duplicate_check.get("matched_user_id")
-        all_workers = fb_service.get_all_workers()
-        matched_worker = all_workers.get(matched_id, {})
-        matched_name = matched_worker.get("name", matched_id)
-        matched_mode = duplicate_check.get("mode", target_mode)
+        if matched_id != req.worker_id:
+            all_workers = fb_service.get_all_workers()
+            matched_worker = all_workers.get(matched_id, {})
+            matched_name = matched_worker.get("name", matched_id)
+            matched_mode = duplicate_check.get("mode", target_mode)
 
-        logging.warning(f"Duplicate enrollment prevented: face matches '{matched_name}' ({matched_id})")
-        return {
-            "success": False,
-            "status": "DUPLICATE_FACE",
-            "biometric_mode": target_mode,
-            "matched_worker_id": matched_id,
-            "matched_name": matched_name,
-            "message": f"Duplicate Enrollment Rejected: This face is already enrolled as '{matched_name}' (ID: {matched_id}) in {matched_mode} Mode!"
-        }
+            logging.warning(f"Duplicate enrollment prevented: face matches '{matched_name}' ({matched_id})")
+            return {
+                "success": False,
+                "status": "DUPLICATE_FACE",
+                "biometric_mode": target_mode,
+                "matched_worker_id": matched_id,
+                "matched_name": matched_name,
+                "message": f"Duplicate Enrollment Rejected: This face is already enrolled as '{matched_name}' (ID: {matched_id}) in {matched_mode} Mode!"
+            }
 
     # 3. Proceed with enrollment since no duplicate exists
     enroll_res = rs_service.enroll_user(req.worker_id, mode=target_mode)
@@ -246,6 +281,10 @@ def register_worker(req: RegisterWorkerRequest):
             biometric_mode=target_mode,
             host_enrolled=(target_mode == "HOST"),
             faceprint_status="STORED_IN_FIREBASE" if target_mode == "HOST" else "STORED_ON_HARDWARE_FLASH",
+            faceprint_vector=enroll_res.get("vector"),
+            vector_version=enroll_res.get("version", 1),
+            features_type=enroll_res.get("featuresType", 0),
+            flags=enroll_res.get("flags", 0),
             image_b64=enroll_res.get("image_b64")
         )
         return {
@@ -268,6 +307,11 @@ def get_attendance_logs(limit: int = 50):
 @app.get("/api/workers")
 def get_workers():
     return fb_service.get_all_workers()
+
+@app.delete("/api/workers/{worker_id}")
+def delete_worker(worker_id: str):
+    success = fb_service.delete_worker(worker_id)
+    return {"success": success, "message": f"Worker '{worker_id}' deleted successfully."}
 
 @app.delete("/api/attendance")
 def clear_attendance_logs():
