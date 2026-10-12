@@ -42,7 +42,7 @@ class FirebaseService:
 
         logger.info("Firebase operating in Local Storage Mode (Ready for Firebase credentials).")
 
-    def save_worker_profile(self, worker_id: str, name: str, department: str = "General", role: str = "Worker", image_b64: str = None, biometric_mode: str = "HOST", host_enrolled: bool = True, faceprint_status: str = "STORED_IN_FIREBASE"):
+    def save_worker_profile(self, worker_id: str, name: str, department: str = "General", role: str = "Worker", image_b64: str = None, biometric_mode: str = "HOST", host_enrolled: bool = True, faceprint_status: str = "STORED_IN_FIREBASE", faceprint_vector: list = None, vector_version: int = 1, features_type: int = 0, flags: int = 0):
         """Stores worker metadata and faceprint profile in Firebase Firestore / Local DB."""
         worker_data = {
             "worker_id": worker_id,
@@ -52,6 +52,10 @@ class FirebaseService:
             "biometric_mode": biometric_mode,  # "HOST" (Stored in Firebase) or "DEVICE" (Hardware flash)
             "host_enrolled": host_enrolled,
             "faceprint_status": faceprint_status,
+            "faceprint_vector": faceprint_vector or [],
+            "vector_version": vector_version,
+            "features_type": features_type,
+            "flags": flags,
             "enrolled_at": datetime.now().isoformat(),
             "image_b64": image_b64,
             "device": "Intel RealSense ID F455"
@@ -60,7 +64,7 @@ class FirebaseService:
         if self.initialized and self.db:
             try:
                 self.db.collection("workers").document(worker_id).set(worker_data)
-                logger.info(f"Saved worker faceprint profile '{worker_id}' ({biometric_mode} mode) to Firebase Firestore.")
+                logger.info(f"Saved worker faceprint profile '{worker_id}' ({biometric_mode} mode) with vector to Firebase Firestore.")
             except Exception as e:
                 logger.error(f"Error saving worker to Firebase: {e}")
 
@@ -95,10 +99,49 @@ class FirebaseService:
         workers = self.get_all_workers()
         return workers.get(worker_id)
 
+    def delete_worker(self, worker_id: str):
+        """Deletes a worker profile and faceprints from Firebase and local backup."""
+        if self.initialized and self.db:
+            try:
+                self.db.collection("workers").document(worker_id).delete()
+                logger.info(f"Worker '{worker_id}' deleted from Firebase Firestore.")
+            except Exception as e:
+                logger.error(f"Error deleting worker from Firebase: {e}")
+
+        workers = self.get_all_workers()
+        if worker_id in workers:
+            del workers[worker_id]
+            try:
+                with open(self.local_workers_file, "w") as f:
+                    json.dump(workers, f, indent=2)
+            except Exception as e:
+                logger.error(f"Local worker delete error: {e}")
+        return True
+
     def get_host_workers(self):
         """Returns all workers registered in Host Mode (Firebase faceprint database)."""
         workers = self.get_all_workers()
         return {wid: w for wid, w in workers.items() if w.get("biometric_mode") == "HOST" or w.get("host_enrolled")}
+
+    def get_all_faceprint_vectors(self):
+        """
+        Retrieves all enrolled host faceprint vectors from Firestore and local backup.
+        Returns list formatted for NativeHostBridge:
+        [{ "worker_id": wid, "vector": [...], "version": 1, "featuresType": 0, "flags": 0 }]
+        """
+        workers = self.get_all_workers()
+        faceprints = []
+        for wid, w in workers.items():
+            vec = w.get("faceprint_vector")
+            if vec and isinstance(vec, list) and len(vec) > 0:
+                faceprints.append({
+                    "worker_id": wid,
+                    "vector": vec,
+                    "version": w.get("vector_version", 1),
+                    "featuresType": w.get("features_type", 0),
+                    "flags": w.get("flags", 0)
+                })
+        return faceprints
 
     def get_last_punch_status(self, worker_id: str):
         """Returns the last punch type for a worker to toggle PUNCH IN vs PUNCH OUT."""

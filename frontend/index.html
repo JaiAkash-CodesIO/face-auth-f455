@@ -1,158 +1,284 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Worker Punch-In / Punch-Out Dashboard - Intel RealSense F455 & Firebase</title>
+  <title>VeriFace ID • Enterprise Biometric Attendance Terminal</title>
   <link rel="stylesheet" href="style.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
 
+  <!-- Floating Toast Notification System -->
+  <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+
+  <!-- Main Enterprise Dashboard Shell -->
   <div class="dashboard-container">
-    <!-- Navbar Header -->
-    <header>
+    
+    <!-- Top Navigation Header -->
+    <header class="navbar-header">
       <div class="brand">
-        <div class="brand-icon">👷</div>
+        <div class="brand-icon-wrapper">
+          <div class="brand-icon">🧬</div>
+          <div class="brand-pulse"></div>
+        </div>
         <div class="brand-title">
-          <h1>Worker Punch-In / Punch-Out System</h1>
-          <p>Intel RealSense ID F455 & Firebase Cloud Faceprints</p>
+          <h1>VeriFace ID <span class="brand-badge">Enterprise v2.4</span></h1>
+          <p>Intel RealSense ID F455 & Firebase Cloud Biometrics</p>
         </div>
       </div>
+
       <div class="header-status">
-        <div class="status-chip">
+        <!-- Live Calendar & Clock Widget -->
+        <div class="status-chip clock-chip" title="System Timezone Clock">
+          <span class="chip-icon">🕒</span>
+          <div class="clock-display">
+            <span id="liveClockTime" class="clock-time">--:--:--</span>
+            <span id="liveClockDate" class="clock-date">--</span>
+          </div>
+        </div>
+
+        <!-- Intel RealSense F455 Hardware Status -->
+        <div class="status-chip device-chip" title="F455 Camera & Biometric Co-Processor">
           <div id="deviceDot" class="dot offline"></div>
-          <span id="deviceStatusText">Checking Device...</span>
+          <div class="chip-content">
+            <span class="chip-label">Camera</span>
+            <strong id="deviceStatusText" class="chip-val">Checking F455...</strong>
+          </div>
         </div>
-        <div class="status-chip" style="border-color: rgba(6, 182, 212, 0.3);">
-          <span>🔥 Firebase Cloud: <strong id="firebaseStatusText">Active</strong></span>
+
+        <!-- Firebase Cloud Status -->
+        <div class="status-chip cloud-chip" title="Google Firebase Firestore Synchronization">
+          <span class="chip-icon fire-icon">🔥</span>
+          <div class="chip-content">
+            <span class="chip-label">Cloud Sync</span>
+            <strong id="firebaseStatusText" class="chip-val val-cyan">Active</strong>
+          </div>
         </div>
-        <div class="status-chip" style="border-color: rgba(168, 85, 247, 0.35);">
-          <span>🧬 Biometric: <strong id="biometricModeText" style="color: #a855f7;">Host Mode (Firebase)</strong></span>
+
+        <!-- Biometric Engine Mode -->
+        <div class="status-chip engine-chip" title="Biometric Matching Architecture">
+          <span class="chip-icon">🧬</span>
+          <div class="chip-content">
+            <span class="chip-label">Engine</span>
+            <strong id="biometricModeText" class="chip-val val-purple">Hybrid Mode</strong>
+          </div>
+        </div>
+
+        <!-- Modern Light / Dark Theme Switcher Button -->
+        <div class="theme-switch-wrapper">
+          <button id="themeToggleBtn" class="theme-toggle-btn" title="Switch Theme (Light / Dark)" aria-label="Toggle Theme">
+            <div class="theme-icon-container">
+              <span id="themeIconDark" class="theme-glyph dark-glyph">🌙</span>
+              <span id="themeIconLight" class="theme-glyph light-glyph">☀️</span>
+            </div>
+            <span id="themeLabel" class="theme-label-text">Dark</span>
+          </button>
         </div>
       </div>
     </header>
 
-    <!-- Hero Status, Live Video & Controls -->
+    <!-- Biometric Command Center (Hero Banner) -->
     <section class="hero-banner">
-      <!-- Main Punch Status Banner -->
+      
+      <!-- Card 1: Biometric Verification HUD Terminal -->
       <div id="statusBanner" class="status-card state-ready">
         <div class="status-card-inner">
           <div class="status-info">
-            <div class="badge-label">Live Attendance Status</div>
+            <div class="badge-label">
+              <span class="pulse-indicator">●</span> Biometric Real-Time Verification
+            </div>
             <div id="mainStatusTitle" class="status-title">READY FOR PUNCH</div>
-            <div id="mainStatusSubtext" class="status-subtext">Step in front of Intel F455 camera and click Punch In / Out</div>
+            <div id="mainStatusSubtext" class="status-subtext">
+              Stand naturally in front of the Intel F455 lens and click <strong>Punch In / Out Now</strong>.
+            </div>
           </div>
+
+          <!-- Face Snapshot Reticle -->
           <div class="snapshot-box">
-            <div class="snapshot-label">Worker Face</div>
-            <img id="capturedSnapshotImg" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100' fill='%2364748b'><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' font-size='40'>👤</text></svg>" alt="Worker Face">
+            <div class="snapshot-frame">
+              <div class="reticle-corner top-left"></div>
+              <div class="reticle-corner top-right"></div>
+              <div class="reticle-corner bottom-left"></div>
+              <div class="reticle-corner bottom-right"></div>
+              <div class="scan-laser" id="scanLaser"></div>
+              <img id="capturedSnapshotImg" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100' fill='%2364748b'><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' font-size='42'>👤</text></svg>" alt="Worker Face Snapshot">
+            </div>
+            <span class="snapshot-label">Face Biometric</span>
           </div>
         </div>
         
+        <!-- Live Metadata Inspection Bar -->
         <div class="status-meta">
           <div class="meta-item">
             <span class="key">Worker ID & Name</span>
             <span id="metaUser" class="val">--</span>
           </div>
           <div class="meta-item">
-            <span class="key">Punch Time</span>
+            <span class="key">Timestamp</span>
             <span id="metaTime" class="val">--</span>
           </div>
           <div class="meta-item">
-            <span class="key">Biometric Mode</span>
+            <span class="key">Verification Engine</span>
             <span id="metaMode" class="val">--</span>
           </div>
           <div class="meta-item">
-            <span class="key">Action Result</span>
+            <span class="key">Punch Status</span>
             <span id="metaAction" class="val">--</span>
           </div>
         </div>
       </div>
 
-      <!-- Live Video Stream Window -->
+      <!-- Card 2: Intel F455 Optical Feed with Futuristic HUD Overlay -->
       <div class="camera-card">
         <div class="camera-header">
-          <span>📹 Intel F455 Camera Feed</span>
-          <span class="live-dot">LIVE</span>
+          <div class="camera-title-group">
+            <span class="cam-icon">📹</span>
+            <span>Intel F455 Optical Feed</span>
+          </div>
+          <div class="camera-telemetry-group">
+            <span class="camera-telemetry">352×640 • 30 FPS</span>
+            <div class="live-indicator">
+              <div class="live-pulse"></div> LIVE
+            </div>
+          </div>
         </div>
+
         <div class="camera-stream-wrapper">
-          <img id="videoFeed" src="/api/video_feed" alt="Intel F455 Live Feed" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'400\' height=\'300\' fill=\'%231e293b\'><text x=\'50%\' y=\'50%\' dominant-baseline=\'middle\' text-anchor=\'middle\' fill=\'%2394a3b8\' font-size=\'16\'>Camera Stream Offline</text></svg>'">
+          <div class="hud-corner top-left"></div>
+          <div class="hud-corner top-right"></div>
+          <div class="hud-corner bottom-left"></div>
+          <div class="hud-corner bottom-right"></div>
+          <div class="hud-reticle-center"></div>
+
+          <img id="videoFeed" src="/api/video_feed" alt="Intel F455 Live Feed" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'400\' height=\'300\' fill=\'%230f172a\'><text x=\'50%\' y=\'50%\' dominant-baseline=\'middle\' text-anchor=\'middle\' fill=\'%2364748b\' font-size=\'15\'>Camera Stream Connecting...</text></svg>'">
         </div>
       </div>
 
-      <!-- Quick Action Controls -->
+      <!-- Card 3: Terminal Control & Actions -->
       <div class="control-card">
-        <h3>⚡ Attendance Actions</h3>
+        <div class="control-header">
+          <h3>⚡ Terminal Actions</h3>
+          <p>Instant attendance check or biometric enrollment</p>
+        </div>
+
+        <div class="mode-select-box">
+          <label for="punchBiometricMode">Verification Engine</label>
+          <div class="select-wrapper">
+            <select id="punchBiometricMode" class="select-field">
+              <option value="HYBRID" selected>⚡ Hybrid (Host Cloud + Hardware Flash)</option>
+              <option value="HOST">🔥 Pure Host Mode (Firebase Cloud Faceprints)</option>
+              <option value="DEVICE">💾 On-Device Mode (F455 Internal Flash)</option>
+            </select>
+          </div>
+        </div>
+
         <div class="button-group">
-          <button id="btnPunchAuto" class="btn btn-primary">
-            <span>🕒</span> PUNCH IN / OUT NOW
+          <button id="btnPunchAuto" class="btn btn-primary" title="Trigger face scan and record attendance">
+            <span class="btn-icon">🕒</span>
+            <span class="btn-text">PUNCH IN / OUT NOW</span>
+            <div class="btn-shimmer"></div>
           </button>
-          <button id="btnOpenRegister" class="btn btn-secondary">
-            <span>👤</span> REGISTER NEW WORKER
+          <button id="btnOpenRegister" class="btn btn-secondary" title="Enroll new worker faceprint">
+            <span class="btn-icon">👤</span>
+            <span class="btn-text">REGISTER NEW WORKER</span>
           </button>
         </div>
       </div>
     </section>
 
-    <!-- Metrics Cards -->
+    <!-- Executive Metrics Grid -->
     <section class="metrics-grid">
       <div class="metric-card">
         <div class="metric-icon purple">🧬</div>
         <div class="metric-info">
           <h4>Host Cloud Workers</h4>
           <p id="statHostUsers">0 Enrolled</p>
+          <span class="metric-sub">Stored in Firebase Firestore</span>
         </div>
       </div>
       <div class="metric-card">
         <div class="metric-icon blue">💾</div>
         <div class="metric-info">
-          <h4>F455 Flash Capacity</h4>
+          <h4>F455 Flash Slots</h4>
           <p id="statRemainingSlots">1,000 / 1,000</p>
+          <div class="capacity-bar-wrap">
+            <div id="capacityBar" class="capacity-bar-fill" style="width: 100%;"></div>
+          </div>
         </div>
       </div>
       <div class="metric-card">
         <div class="metric-icon green">🟢</div>
         <div class="metric-info">
-          <h4>Total Punch-Ins</h4>
+          <h4>Today's Punch-Ins</h4>
           <p id="statPunchIns">0</p>
+          <span class="metric-sub">Shift arrivals logged</span>
         </div>
       </div>
       <div class="metric-card">
-        <div class="metric-icon red">🔴</div>
+        <div class="metric-icon red">🔵</div>
         <div class="metric-info">
-          <h4>Total Punch-Outs</h4>
+          <h4>Today's Punch-Outs</h4>
           <p id="statPunchOuts">0</p>
+          <span class="metric-sub">Shift departures logged</span>
         </div>
       </div>
     </section>
 
-    <!-- Firebase Live Logs Section -->
+    <!-- Live Attendance Audit Stream Section -->
     <section class="logs-section">
       <div class="table-header">
-        <h3><span>📋</span> Firebase Attendance Log Stream</h3>
-        <button id="btnClearLogs" class="btn btn-secondary" style="padding: 8px 14px; font-size: 0.82rem;">
-          🗑️ Clear Attendance Logs
-        </button>
+        <div class="table-header-left">
+          <div class="table-title-wrap">
+            <h3><span>📋</span> Live Attendance Audit Stream</h3>
+            <span id="logCounterBadge" class="table-count-badge">0 Records</span>
+          </div>
+          
+          <!-- Filter Tabs -->
+          <div class="filter-tabs">
+            <button class="filter-tab active" data-filter="ALL">All Records</button>
+            <button class="filter-tab" data-filter="PUNCH_IN">🟢 Punch In</button>
+            <button class="filter-tab" data-filter="PUNCH_OUT">🔵 Punch Out</button>
+            <button class="filter-tab" data-filter="DENIED">⛔ Denied</button>
+          </div>
+        </div>
+
+        <div class="table-header-controls">
+          <div class="search-box">
+            <span class="search-icon">🔍</span>
+            <input type="text" id="logSearchInput" class="search-input" placeholder="Search by name, ID or mode...">
+            <button id="btnClearSearch" class="search-clear-btn" style="display: none;" title="Clear search">✕</button>
+          </div>
+          <button id="btnExportCSV" class="btn btn-secondary btn-table-action" title="Export records to CSV file">
+            📥 Export CSV
+          </button>
+          <button id="btnRefreshLogs" class="btn btn-secondary btn-table-action" title="Refresh attendance records">
+            🔄 Refresh
+          </button>
+          <button id="btnClearLogs" class="btn btn-secondary btn-table-action btn-danger-action" title="Clear audit records">
+            🗑️ Clear Logs
+          </button>
+        </div>
       </div>
 
       <div class="table-container">
         <table>
           <thead>
             <tr>
-              <th>Face Photo</th>
-              <th>Date & Time</th>
-              <th>Punch Action</th>
-              <th>Worker ID & Name</th>
-              <th>Biometric Auth Mode</th>
-              <th>Verification Message</th>
+              <th style="width: 70px;">Face Photo</th>
+              <th style="width: 170px;">Date & Time</th>
+              <th style="width: 130px;">Punch Action</th>
+              <th style="width: 220px;">Worker ID & Name</th>
+              <th style="width: 150px;">Biometric Mode</th>
+              <th>Verification Audit Message</th>
             </tr>
           </thead>
           <tbody id="logsTableBody">
             <tr>
-              <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">
-                Connecting to live stream...
+              <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 40px;">
+                Connecting to live attendance stream...
               </td>
             </tr>
           </tbody>
@@ -161,29 +287,67 @@
     </section>
   </div>
 
-  <!-- Register Worker Modal -->
-  <div id="registerModal" class="modal-overlay">
+  <!-- Register Worker Modal Dialog -->
+  <div id="registerModal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
     <div class="modal-content">
-      <h3 style="font-size: 1.25rem;">Register New Worker</h3>
-      <p style="font-size: 0.88rem; color: var(--text-muted);">
-        Enter worker details. The Intel F455 camera will capture the faceprint and store the profile in Firebase Cloud.
-      </p>
-      
-      <label style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-top: 10px; margin-bottom: 4px;">Biometric Mode</label>
-      <select id="regBiometricMode" class="input-field" style="margin-bottom: 12px; cursor: pointer; background: var(--bg-card); color: var(--text-main);">
-        <option value="HOST" selected>🔥 Pure Host Mode (Faceprint Stored in Firebase Cloud)</option>
-        <option value="DEVICE">💾 On-Device Mode (Faceprint Stored in F455 Hardware Flash)</option>
-      </select>
-
-      <input type="text" id="regWorkerId" class="input-field" placeholder="Worker ID (e.g. W_101)">
-      <input type="text" id="regName" class="input-field" placeholder="Full Name (e.g. Govardhan)">
-      <input type="text" id="regDepartment" class="input-field" placeholder="Department (e.g. Construction / IT)">
-      <input type="text" id="regRole" class="input-field" placeholder="Role (e.g. Supervisor / Engineer)">
-      
-      <div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 14px;">
-        <button id="btnCloseModal" class="btn btn-secondary">Cancel</button>
-        <button id="btnSubmitRegister" class="btn btn-primary">Capture & Save Faceprint</button>
+      <div class="modal-header">
+        <div class="modal-title-row">
+          <h3 id="modalTitle">Register New Worker</h3>
+          <button id="btnCloseModalX" class="modal-close-x" title="Close dialog">✕</button>
+        </div>
+        <p>Position the employee centered in front of the Intel F455 camera lens (0.5m – 1.0m) to extract biometric faceprints.</p>
       </div>
+      
+      <div class="form-body">
+        <div class="form-group">
+          <label for="regBiometricMode">Biometric Storage Target</label>
+          <select id="regBiometricMode" class="select-field">
+            <option value="HOST" selected>🔥 Pure Host Mode (Biometric Vectors Stored in Firebase Cloud)</option>
+            <option value="DEVICE">💾 On-Device Mode (Biometric Vectors Stored in F455 Flash)</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="regWorkerId">Worker ID <span class="required">*</span></label>
+          <input type="text" id="regWorkerId" class="input-field" placeholder="e.g. EMP_101 or W_204" required>
+        </div>
+
+        <div class="form-group">
+          <label for="regName">Full Name <span class="required">*</span></label>
+          <input type="text" id="regName" class="input-field" placeholder="e.g. Jai Akash / Govardhan" required>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group flex-1">
+            <label for="regDepartment">Department</label>
+            <input type="text" id="regDepartment" class="input-field" placeholder="e.g. Engineering">
+          </div>
+
+          <div class="form-group flex-1">
+            <label for="regRole">Role</label>
+            <input type="text" id="regRole" class="input-field" placeholder="e.g. Specialist">
+          </div>
+        </div>
+      </div>
+      
+      <div class="modal-actions">
+        <button id="btnCloseModal" class="btn btn-secondary">Cancel</button>
+        <button id="btnSubmitRegister" class="btn btn-primary">
+          <span>🧬</span> Capture & Save Faceprint
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Image Preview Lightbox Modal -->
+  <div id="imagePreviewModal" class="modal-overlay image-preview-overlay">
+    <div class="preview-box">
+      <img id="previewModalImg" src="" alt="Worker Full Snapshot">
+      <div class="preview-details">
+        <h4 id="previewModalName">Worker Name</h4>
+        <p id="previewModalMeta">Timestamp • Action</p>
+      </div>
+      <button id="btnCloseImagePreview" class="preview-close-btn">✕</button>
     </div>
   </div>
 
